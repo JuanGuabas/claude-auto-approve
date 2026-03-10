@@ -8,8 +8,16 @@ echo "Installing Claude Auto-Approve..."
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
 
-# Download source
-curl -sL https://raw.githubusercontent.com/JuanGuabas/claude-auto-approve/main/ClaudeAutoApprove.swift -o ClaudeAutoApprove.swift
+# Download source (use GitHub API for reliability)
+REPO="JuanGuabas/claude-auto-approve"
+curl -sL -H "Accept: application/vnd.github.raw+json" \
+  "https://api.github.com/repos/${REPO}/contents/ClaudeAutoApprove.swift" \
+  -o ClaudeAutoApprove.swift
+
+if [ ! -s ClaudeAutoApprove.swift ]; then
+  echo "Error: Failed to download source. Try: gh repo clone ${REPO}"
+  exit 1
+fi
 
 # Compile
 echo "Compiling..."
