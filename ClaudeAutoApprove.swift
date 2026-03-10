@@ -11,11 +11,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var countMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         if let button = statusItem.button {
-            button.title = "⚡ OFF"
+            if let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "Auto-Approve") {
+                img.isTemplate = true
+                button.image = img
+            } else {
+                button.title = "AA"
+            }
+            button.toolTip = "Claude Auto-Approve: OFF"
         }
+
+        statusItem.isVisible = true
 
         let menu = NSMenu()
         toggleMenuItem = NSMenuItem(title: "Enable Auto-Approve", action: #selector(toggleAutoApprove), keyEquivalent: "a")
@@ -42,12 +50,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         approvedHashes.removeAll()
 
         if isActive {
-            statusItem.button?.title = "⚡ ON"
+            if let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "ON") {
+                let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .bold)
+                statusItem.button?.image = img.withSymbolConfiguration(config)
+            }
+            statusItem.button?.toolTip = "Claude Auto-Approve: ON"
+            statusItem.button?.contentTintColor = .systemGreen
             toggleMenuItem.title = "Disable Auto-Approve"
             startMonitoring()
             showNotification(title: "Claude Auto-Approve", body: "Auto-approve ENABLED")
         } else {
-            statusItem.button?.title = "⚡ OFF"
+            if let img = NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: "OFF") {
+                img.isTemplate = true
+                statusItem.button?.image = img
+            }
+            statusItem.button?.toolTip = "Claude Auto-Approve: OFF"
+            statusItem.button?.contentTintColor = nil
             toggleMenuItem.title = "Enable Auto-Approve"
             stopMonitoring()
             showNotification(title: "Claude Auto-Approve", body: "Auto-approve DISABLED — \(approveCount) approved")
