@@ -5,7 +5,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var isActive = false
     var timer: Timer?
-    var lastApprovedHash = ""
+    var approvedHashes = Set<String>()
     var approveCount = 0
     var toggleMenuItem: NSMenuItem!
     var countMenuItem: NSMenuItem!
@@ -15,9 +15,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             button.title = "⚡ OFF"
-            button.action = #selector(toggleFromClick)
-            button.target = self
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         let menu = NSMenu()
@@ -40,30 +37,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    @objc func toggleFromClick() {
-        toggleAutoApprove()
-    }
-
     @objc func toggleAutoApprove() {
         isActive.toggle()
+        approvedHashes.removeAll()
 
         if isActive {
             statusItem.button?.title = "⚡ ON"
             toggleMenuItem.title = "Disable Auto-Approve"
             startMonitoring()
-            showNotification(title: "Claude Auto-Approve", body: "Auto-approve ENABLED — Claude can work freely")
+            showNotification(title: "Claude Auto-Approve", body: "Auto-approve ENABLED")
         } else {
             statusItem.button?.title = "⚡ OFF"
             toggleMenuItem.title = "Enable Auto-Approve"
             stopMonitoring()
-            showNotification(title: "Claude Auto-Approve", body: "Auto-approve DISABLED — Approved \(approveCount) prompts this session")
+            showNotification(title: "Claude Auto-Approve", body: "Auto-approve DISABLED — \(approveCount) approved")
         }
     }
 
     func startMonitoring() {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            self?.checkAndApprove()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+            DispatchQueue.global(qos: .userInitiated).async {
+                self?.checkAndApprove()
+            }
         }
     }
 
@@ -75,49 +71,186 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func checkAndApprove() {
         guard isActive else { return }
 
-        // Check both Terminal.app and iTerm2
-        if let content = getTerminalContent(app: "Terminal") {
-            processContent(content, app: "Terminal")
+        // Scan ALL windows and tabs in Terminal.app
+        let terminalScript = """
+        set results to ""
+        tell application "System Events"
+            if not (exists process "Terminal") then return ""
+        end tell
+        tell application "Terminal"
+            repeat with w in windows
+                set winIdx to index of w
+                repeat with t in tabs of w
+                    set tabIdx to 0
+                    try
+                        set tabContents to contents of t
+                        set contentLen to length of tabContents
+                        if contentLen > 1000 then
+                            set tabContents to text ((contentLen) - 1000) thru -1 of tabContents
+                        end if
+                        set results to results & "<<<TAB:" & winIdx & ">>>" & tabContents
+                    end try
+                end repeat
+            end repeat
+        end tell
+        return results
+        """
+
+        if let allContent = runAppleScript(terminalScript), !allContent.isEmpty {
+            // Split by tab markers and process each
+            let tabs = allContent.components(separatedBy: "<<<TAB:")
+            for tab in tabs {
+                guard !tab.isEmpty else { continue }
+                // Extract window index from "N>>>content"
+                let parts = tab.components(separatedBy: ">>>")
+                guard parts.count >= 2 else { continue }
+                let winIdx = parts[0]
+                let content = parts.dropFirst().joined(separator: ">>>")
+                processTab(content: content, app: "Terminal", windowIndex: winIdx)
+            }
         }
-        if let content = getTerminalContent(app: "iTerm") {
-            processContent(content, app: "iTerm")
+
+        // Also check iTerm2
+        let itermScript = """
+        tell application "System Events"
+            if not (exists process "iTerm2") then return ""
+        end tell
+        tell application "iTerm2"
+            set results to ""
+            repeat with w in windows
+                set winIdx to index of w
+                repeat with t in tabs of w
+                    repeat with s in sessions of t
+                        try
+                            set sText to text of s
+                            set contentLen to length of sText
+                            if contentLen > 1000 then
+                                set sText to text ((contentLen) - 1000) thru -1 of sText
+                            end if
+                            set results to results & "<<<TAB:" & winIdx & ">>>" & sText
+                        end try
+                    end repeat
+                end repeat
+            end repeat
+            return results
+        end tell
+        """
+
+        if let allContent = runAppleScript(itermScript), !allContent.isEmpty {
+            let tabs = allContent.components(separatedBy: "<<<TAB:")
+            for tab in tabs {
+                guard !tab.isEmpty else { continue }
+                let parts = tab.components(separatedBy: ">>>")
+                guard parts.count >= 2 else { continue }
+                let winIdx = parts[0]
+                let content = parts.dropFirst().joined(separator: ">>>")
+                processTab(content: content, app: "iTerm2", windowIndex: winIdx)
+            }
         }
     }
 
-    func getTerminalContent(app: String) -> String? {
-        let script: String
-        if app == "Terminal" {
-            script = """
-            tell application "System Events"
-                if not (exists process "Terminal") then return ""
-            end tell
-            tell application "Terminal"
-                if (count of windows) = 0 then return ""
-                set t to contents of selected tab of front window
-                if length of t > 600 then
-                    set t to text ((length of t) - 600) thru -1 of t
-                end if
-                return t
-            end tell
-            """
-        } else {
-            script = """
-            tell application "System Events"
-                if not (exists process "iTerm2") then return ""
-            end tell
-            tell application "iTerm2"
-                if (count of windows) = 0 then return ""
-                tell current session of current tab of current window
-                    set t to text
-                    if length of t > 600 then
-                        set t to text ((length of t) - 600) thru -1 of t
-                    end if
-                    return t
-                end tell
-            end tell
-            """
+    func processTab(content: String, app: String, windowIndex: String) {
+        guard !content.isEmpty else { return }
+
+        // Only look at the LAST 400 chars (the active prompt area)
+        let tail = String(content.suffix(400))
+
+        // Create a hash to avoid re-approving the same prompt
+        let hash = "\(app)-\(windowIndex)-\(tail.hashValue)"
+        if approvedHashes.contains(hash) { return }
+
+        // Detect Claude Code permission prompts
+        // Claude Code shows various prompt patterns when waiting for approval:
+        let hasPrompt = detectClaudePrompt(in: tail)
+
+        if hasPrompt {
+            sendApproval(app: app, windowIndex: windowIndex)
+            approvedHashes.insert(hash)
+
+            // Keep hash set from growing forever (max 200)
+            if approvedHashes.count > 200 {
+                approvedHashes.removeFirst()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.approveCount += 1
+                self.countMenuItem.title = "Approved: \(self.approveCount)"
+            }
+        }
+    }
+
+    func detectClaudePrompt(in text: String) -> Bool {
+        // Claude Code permission prompt patterns
+        // The terminal shows tool use blocks and waits for user input
+        let patterns: [(String, Bool)] = [
+            // Claude Code CLI prompt patterns
+            ("Allow once", false),
+            ("Allow always", false),
+            ("allow this action", true),
+            ("Do you want to proceed", true),
+            ("Allow tool", true),
+            ("approve this", true),
+            // Claude Code shows "Yes" / "No" choices
+            ("(Y)es", false),
+            // Bash tool permission prompt
+            ("Run command", true),
+            // Edit/Write permission
+            ("Write to", true),
+            // The actual prompt waiting patterns at end of output
+            ("Allow?", false),
+            ("allow?", false),
+            ("(y/N)", false),
+            ("(Y/n)", false),
+            ("[Y/n]", false),
+            ("[y/N]", false),
+            // Claude sometimes shows these
+            ("Press Enter to allow", true),
+            ("enter to continue", true),
+        ]
+
+        for (pattern, caseInsensitive) in patterns {
+            if caseInsensitive {
+                if text.range(of: pattern, options: .caseInsensitive) != nil {
+                    return true
+                }
+            } else {
+                if text.contains(pattern) {
+                    return true
+                }
+            }
         }
 
+        return false
+    }
+
+    func sendApproval(app: String, windowIndex: String) {
+        // Focus the specific window and send 'y' keystroke
+        let script = """
+        tell application "\(app)"
+            set index of window \(windowIndex) to 1
+            activate
+        end tell
+        delay 0.15
+        tell application "System Events"
+            keystroke "y"
+            delay 0.1
+            keystroke return
+        end tell
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {}
+    }
+
+    func runAppleScript(_ script: String) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", script]
@@ -136,67 +269,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func processContent(_ content: String, app: String) {
-        guard !content.isEmpty else { return }
-
-        // Hash the last 200 chars to detect new prompts
-        let tail = String(content.suffix(200))
-        let hash = tail.hashValue.description
-
-        // Skip if we already approved this exact content
-        if hash == lastApprovedHash { return }
-
-        // Detect Claude Code permission prompts
-        // Claude shows tool use blocks ending with approval prompts
-        let permissionPatterns = [
-            "Allow once",           // Claude Code "Allow once" button text
-            "Allow always",         // Claude Code "Allow always" option
-            "(Y)es",               // Yes/No prompt pattern
-            "Do you want to allow",
-            "Allow tool",
-            "Press y to allow",
-            "approve this action",
-        ]
-
-        let hasPrompt = permissionPatterns.contains { pattern in
-            content.range(of: pattern, options: .caseInsensitive) != nil
-        }
-
-        if hasPrompt {
-            sendApproval(app: app)
-            lastApprovedHash = hash
-            approveCount += 1
-            countMenuItem.title = "Approved: \(approveCount)"
-        }
-    }
-
-    func sendApproval(app: String) {
-        let script = """
-        tell application "\(app == "iTerm" ? "iTerm2" : app)"
-            activate
-        end tell
-        delay 0.15
-        tell application "System Events"
-            keystroke "y"
-        end tell
-        """
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {}
-    }
-
     func showNotification(title: String, body: String) {
-        let script = """
-        display notification "\(body)" with title "\(title)"
-        """
+        let script = "display notification \"\(body)\" with title \"\(title)\""
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", script]
@@ -212,7 +286,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Main
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)  // No dock icon, menu bar only
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
